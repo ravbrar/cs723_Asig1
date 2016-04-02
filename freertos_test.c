@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "vga_task.h"
+
 // Scheduler includes
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -10,6 +12,7 @@
 #include "freertos/semphr.h"
 
 #include <unistd.h>
+#include "freq_struct.h"
 #include "altera_up_avalon_video_character_buffer_with_dma.h"
 #include "altera_up_avalon_video_pixel_buffer_dma.h"
 
@@ -30,17 +33,46 @@
 #define LED_OUT_PRIORITY 2
 #define LOAD_USER_MNGMNT_PRIORITY 3
 #define FREQUENCY_CALCULATOR_PRIORITY 4
+#define NO_OF_LOADS 8
 
+// loads array
+int loads[NO_OF_LOADS];
+int controller_inputs[NO_OF_LOADS];
+int user_inputs[NO_OF_LOADS];
+int no_of_activated_loads = 0;
 
+int loads_shed = 0;
+int relay_leds = 0;
+int red_led_out = 0;
+int green_led_out = 0;
+
+enum load_state{
+    off=0,
+    on,
+    shed
+};
+
+enum load_state load_state_array[NO_OF_LOADS];
 
 // Definition of Message Queue
 #define   MSG_QUEUE_SIZE  30
 QueueHandle_t msgqueue;
 
+QueueHandle_t load_mngmnt_queue;
+
 // used to delete a task
  TaskHandle_t xHandle = NULL;
 
- TaskHandle_t xTaskToNotify = NULL;
+ TaskHandle_t xFreqTask;
+
+ TaskHandle_t xLoadMgnmntTask;
+
+ TaskHandle_t xbuttonLEDs;
+
+// user inputs
+
+
+ SemaphoreHandle_t x_sem_loads;
 
 
 // Definition of Semaphore
@@ -48,8 +80,8 @@ SemaphoreHandle_t shared_resource_sem;
 
 // globals variables for interrupt functions
 
-int frequency_value = 0;
-
+double frequency_value = 0;
+int buttonValue = 0;
 // Local Function Prototypes
 int initOSDataStructs(void);
 int initCreateTasks(void);
@@ -96,7 +128,7 @@ void button_interrupts_function(void* context, alt_u32 id)
 {
   // need to cast the context first before using it
 	printf("button pressed \n");
-	int buttonValue = 0;
+
 	BaseType_t xHigherPriorityTaskWoken;
 
 	buttonValue = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
@@ -106,7 +138,7 @@ void button_interrupts_function(void* context, alt_u32 id)
 
 	xHigherPriorityTaskWoken = pdFALSE;
 
-	xTaskNotifyFromISR( xHandle,
+	xTaskNotifyFromISR( xbuttonLEDs,
 			buttonValue,
 	                        eSetValueWithOverwrite,
 	                        &xHigherPriorityTaskWoken );
@@ -118,13 +150,14 @@ void button_interrupts_function(void* context, alt_u32 id)
 void frequency_interrupt_function(void* context, alt_u32 id){
 
 	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	uint32_t value;
 
 	configASSERT(xTaskToNotify != NULL);
-	frequency_value = 16000 / IORD_ALTERA_AVALON_PIO_DATA(FREQUENCY_ANALYSER_BASE);
-	vTaskNotifyGiveFromISR( xTaskToNotify, &xHigherPriorityTaskWoken );
-	printf("frequecny ISR %d\n", frequency_value);
+	value = IORD_ALTERA_AVALON_PIO_DATA(FREQUENCY_ANALYSER_BASE);
+	xTaskNotifyFromISR( xFreqTask, value, eSetBits, &xHigherPriorityTaskWoken );
+	//printf("frequecny ISR %d\n", frequency_value);
 	//printf("HANDLE: %d\n",(int)xTaskToNotify);
-	//portEND_SWITCHING_ISR( xHigherPriorityTaskWoken );
+	portEND_SWITCHING_ISR( xHigherPriorityTaskWoken );
 }
 
 
@@ -141,49 +174,155 @@ void VGA_task(void* pvParameters){
 }
 
 void frequency_calculator(void* pvParameters){
+	uint32_t ulNotificationValue, frequency_previous;
+	double frequency_delta, abs_delta;
+	struct freq_struct freq;
+	static int activate_load_management = 0;
 
-	xTaskToNotify = xTaskGetCurrentTaskHandle();
-	printf("HANDLE TASK: %d\n",xTaskToNotify);
 	while(1){
-		ulTaskNotifyTake( pdTRUE, portMAX_DELAY );
+		//printf("Current Frequecny TASK: %d \n", frequency_value);
+//		ulNotificationValue = ulTaskNotifyTake( pdTRUE, portMAX_DELAY );
+		xTaskNotifyWait(0x00,               /* Don't clear any bits on entry. */
+					 ULONG_MAX,          /* Clear all bits on exit. */
+					 &ulNotificationValue, /* Receives the notification value. */
+					 portMAX_DELAY );    /* Block indefinitely. */
+		frequency_previous = frequency_value;
+		frequency_value = 16000.0 / ulNotificationValue;
+		frequency_delta = (frequency_value - frequency_previous) * 2.0 * frequency_value * frequency_previous / (frequency_value + frequency_previous);
+		freq.current = frequency_value;
+		freq.delta = frequency_delta;
+		abs_delta = frequency_delta < 0 ? frequency_delta * -1 : frequency_delta;
+		//printf("activate_load_management %d  \n", activate_load_management);
+		//printf("frequency_delta %f  \n", (frequency_delta));
+		if (((frequency_value < thres_freq) || (abs_delta > thres_delta) ) && activate_load_management == 0){
+			activate_load_management = 1;
+			xQueueSendToBack( load_mngmnt_queue, (void *)&activate_load_management, (TickType_t)0 );
+		}else if ((frequency_value >= thres_freq && abs_delta <= thres_delta )  && activate_load_management == 1){
+			activate_load_management = 0;
+			xQueueSendToBack( load_mngmnt_queue, (void *)&activate_load_management, (TickType_t)0 );
+		}
 
-		        /* The transmission ended as expected. */
-				printf("Current Frequecny: %d \n", frequency_value);
-				//usleep(1000000);
+		//printf("Frequency %.2f Hz \n", frequency_value);
+		//printf("dF/dt %.2f \n", frequency_delta);
+
+				xQueueSendToBack( Q_freq_data, (void *)&freq, (TickType_t)0 );
+
+
+		//if (frequency_previous != frequency_value)
+		//	printf("Frequency %.2f Hz \n", frequency_value);
 	}
 
 }
 
+void load_user_inputs(void){
+
+	int user_input = IORD_ALTERA_AVALON_PIO_DATA(SLIDE_SWITCH_BASE);
+	int i;
+	for( i = 0; i<NO_OF_LOADS; i++){
+		loads[i] = user_input & 1<<i ? 1 : 0;
+	}
+
+}
 void load_user_mgmnt(void* pvParameters){
+	int i;
+	int initiate_load_shed = 0;
+		while(1){
 
-	while(1){
 
-	}
+			load_user_inputs();
+
+			 if( xQueueReceive( load_mngmnt_queue, &( load_stability_flag ), ( TickType_t ) pdMS_TO_TICKS(500) ) )
+			        {
+			            // pcRxedMessage now points to the struct AMessage variable posted
+			            // by vATask.
+				 	 //
+				 no_of_activated_loads = 0;
+					for( i = 0; i<NO_OF_LOADS; i++){
+						no_of_activated_loads += loads[i];
+						}
+				 	 if (load_stability_flag == 1 && loads_shed == 0 && (loads_shed < no_of_activated_loads)){ // needs to be within 200ms
+				 		 shed_load();
+				 	 }
+
+
+			        }
+			 else if(load_stability_flag == 1 && (loads_shed < no_of_activated_loads)){
+				 shed_load();
+				 //printf("drop another load \n");
+
+			 }
+			 else if(load_stability_flag == 0){
+				 if(loads_shed > 0){
+
+					 reenable_load();
+
+
+				 }else{
+						for( i = 0; i<NO_OF_LOADS; i++){
+								load_state_array[i] = loads[i] ? on : off;
+							}
+				 }
+
+
+			 }
+			 red_led_out = 0;
+			 green_led_out = 0;
+				for( i = 0; i<NO_OF_LOADS; i++){
+						red_led_out += load_state_array[i] == on ? 1 << i : 0;
+						green_led_out += load_state_array[i] == shed ? 1 << i : 0;
+					}
+
+
+				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, red_led_out);
+				IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, green_led_out);
+
+		}
+
+
 }
 
-void Led_Out(void* pvParameters){
-	uint32_t buttonValue;
-	xHandle = xTaskGetCurrentTaskHandle();
-	while(1){
+void reenable_load(void){
 
-		 xTaskNotifyWait( 0x00,
-		                         ULONG_MAX,
-		                         &buttonValue,
-		                         portMAX_DELAY );
-		IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, buttonValue);
-		printf("LED TASK\n");
+	int i;
+	for( i = NO_OF_LOADS; i >= 0; i--){
+		if (load_state_array[i] == shed) {
+			load_state_array[i] = on;
+			loads_shed--;
+			printf("load reenabled: %d \n", i);
+			break;
+		}
 	}
+}
+void shed_load(void){
+
+	int i;
+	for( i = 0; i<NO_OF_LOADS; i++){
+		if (load_state_array[i] == on) {
+			load_state_array[i] = shed;
+			loads_shed++;
+			printf("load shed: %d \n", i);
+			break;
+		}
+	}
+
+
 }
 
 
 
 int main(int argc, char* argv[], char* envp[])
 {
+	printf("Started\n");
 	initOSDataStructs();
+	printf("Init structs\n");
 	initInterrupts();
+	printf("Init interrupts\n");
 	initVGA();
+	printf("Init vga\n");
 	initCreateTasks();
+	printf("Init tasks\n");
 	vTaskStartScheduler();
+	printf("Init scheduler\n");
 	for (;;);
 	return 0;
 }
@@ -191,7 +330,7 @@ int main(int argc, char* argv[], char* envp[])
 
 void initVGA(void){
 	//reset the display
-		alt_up_pixel_buffer_dma_dev *pixel_buf;
+
 		pixel_buf = alt_up_pixel_buffer_dma_open_dev(VIDEO_PIXEL_BUFFER_DMA_NAME);
 		if(pixel_buf == NULL){
 			printf("Cannot find pixel buffer device\n");
@@ -204,6 +343,7 @@ void initVGA(void){
 		if(char_buf == NULL){
 			printf("can't find char buffer device\n");
 		}
+		alt_up_char_buffer_clear(char_buf);
 }
 void initInterrupts(void){
 
@@ -229,15 +369,20 @@ void initInterrupts(void){
 	    // enable interrupts for all buttons
 	    IOWR_ALTERA_AVALON_PIO_IRQ_MASK(PUSH_BUTTON_BASE, 0x7);
 	  alt_irq_register(PUSH_BUTTON_IRQ, NULL, button_interrupts_function);
-
-
+//
+//
 	  	 // frequency analyzer
 	  alt_irq_register(FREQUENCY_ANALYSER_IRQ,(void*)&frequency_value, frequency_interrupt_function);
 }
 // This function simply creates a message queue and a semaphore
 int initOSDataStructs(void)
 {
-
+	thres_freq = 49.00;
+	thres_delta = 25.00;
+	load_stability_flag = 0;
+	x_sem_loads = xSemaphoreCreateBinary();
+	Q_freq_data = xQueueCreate( 100, sizeof( struct freq_struct) );
+	load_mngmnt_queue = xQueueCreate( MSG_QUEUE_SIZE, sizeof( int) );
 	msgqueue = xQueueCreate( MSG_QUEUE_SIZE, sizeof( void* ) );
 	shared_resource_sem = xSemaphoreCreateCounting( 9999, 1 );
 	return 0;
@@ -248,10 +393,12 @@ int initCreateTasks(void)
 {
 
 
-	//xTaskCreate(VGA_task, "VGA_task", TASK_STACKSIZE, NULL, VGA_TASK_PRIORITY, NULL);
-	//xTaskCreate(Led_Out, "Led_Out", TASK_STACKSIZE, NULL, LED_OUT_PRIORITY, NULL);
-	//xTaskCreate(load_user_mgmnt, "load_user_mgmnt", TASK_STACKSIZE, NULL, LOAD_USER_MNGMNT_PRIORITY, NULL);
-	//xTaskCreate(frequency_calculator, "frequency_calculator", TASK_STACKSIZE, NULL, FREQUENCY_CALCULATOR_PRIORITY, NULL);
+
+	//create_vga_task();
+	xTaskCreate(PRVGADraw_Task, "VGA_Task", TASK_STACKSIZE, NULL, VGA_TASK_PRIORITY, &PRVGADraw);
+//	xTaskCreate(Led_Out, "Led_Out", TASK_STACKSIZE, NULL, LED_OUT_PRIORITY, &xbuttonLEDs);
+	xTaskCreate(load_user_mgmnt, "load_user_mgmnt", TASK_STACKSIZE, NULL, LOAD_USER_MNGMNT_PRIORITY, &xLoadMgnmntTask);
+	xTaskCreate(frequency_calculator, "frequency_calculator", TASK_STACKSIZE, NULL, FREQUENCY_CALCULATOR_PRIORITY, &xFreqTask);
 
 
 	return 0;
