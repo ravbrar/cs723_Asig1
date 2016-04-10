@@ -32,8 +32,11 @@
 #define VGA_TASK_PRIORITY 1
 #define LED_OUT_PRIORITY 2
 #define LOAD_USER_MNGMNT_PRIORITY 3
-#define FREQUENCY_CALCULATOR_PRIORITY 4
+#define SYSTEM_STABILITY_PRIORITY 4
+#define FREQUENCY_CALCULATOR_PRIORITY 5
 #define NO_OF_LOADS 8
+
+
 
 // loads array
 int loads[NO_OF_LOADS];
@@ -45,6 +48,13 @@ int loads_shed = 0;
 int relay_leds = 0;
 int red_led_out = 0;
 int green_led_out = 0;
+
+int tick_load_mngmnt_entry = 0;
+int tick_load_first_shed=0;
+
+
+
+
 
 enum load_state{
     off=0,
@@ -59,9 +69,14 @@ enum load_state load_state_array[NO_OF_LOADS];
 QueueHandle_t msgqueue;
 
 QueueHandle_t load_mngmnt_queue;
+QueueHandle_t stability_queue;
+
+
 
 // used to delete a task
  TaskHandle_t xHandle = NULL;
+
+ TaskHandle_t xSystemStabilityTask;
 
  TaskHandle_t xFreqTask;
 
@@ -81,7 +96,10 @@ SemaphoreHandle_t shared_resource_sem;
 // globals variables for interrupt functions
 
 double frequency_value = 0;
-int buttonValue = 0;
+
+int user_management_mode = 0;
+int system_management_mode = 0;
+
 // Local Function Prototypes
 int initOSDataStructs(void);
 int initCreateTasks(void);
@@ -108,6 +126,24 @@ void ps2_isr (void* context, alt_u32 id)
     {
       case KB_ASCII_MAKE_CODE :
         printf ( "ASCII   : %x\n", key ) ;
+        switch(key){
+        case 0x75:  thres_freq += 0.2;
+        	printf("new freq %.2f", thres_freq);
+        	break;
+        case 0x72:  thres_freq -= 0.2;
+        		printf("new freq %.2f", thres_freq);
+        	break;
+        case 0x6B:  thres_delta -= 0.2;
+        		printf("new delta %.2f", thres_delta);
+        	break;
+        case 0x74:  thres_delta += 0.2;
+        		printf("new delta %.2f", thres_delta);
+        	break;
+        default:
+        	printf("Unwanted input\n");
+        	break;
+
+        }
         break ;
       case KB_LONG_BINARY_MAKE_CODE :
         // do nothing
@@ -126,6 +162,7 @@ void ps2_isr (void* context, alt_u32 id)
 
 void button_interrupts_function(void* context, alt_u32 id)
 {
+	int buttonValue = 0;
   // need to cast the context first before using it
 	printf("button pressed \n");
 
@@ -134,14 +171,13 @@ void button_interrupts_function(void* context, alt_u32 id)
 	buttonValue = IORD_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE);
 	// clears the edge capture register
 	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(PUSH_BUTTON_BASE, 0x7);
+	printf("buttonValue %d\n", buttonValue);
+	//buttonValue &= 0x4;
 
+	if (buttonValue == 0x4){
+		user_management_mode ^= 1;
+	}
 
-	xHigherPriorityTaskWoken = pdFALSE;
-
-	xTaskNotifyFromISR( xbuttonLEDs,
-			buttonValue,
-	                        eSetValueWithOverwrite,
-	                        &xHigherPriorityTaskWoken );
 
 	//portEND_SWITCHING_ISR( xHigherPriorityTaskWoken );
  }
@@ -196,10 +232,10 @@ void frequency_calculator(void* pvParameters){
 		//printf("frequency_delta %f  \n", (frequency_delta));
 		if (((frequency_value < thres_freq) || (abs_delta > thres_delta) ) && activate_load_management == 0){
 			activate_load_management = 1;
-			xQueueSendToBack( load_mngmnt_queue, (void *)&activate_load_management, (TickType_t)0 );
+			xQueueSendToBack( stability_queue, (void *)&activate_load_management, (TickType_t)0 );
 		}else if ((frequency_value >= thres_freq && abs_delta <= thres_delta )  && activate_load_management == 1){
 			activate_load_management = 0;
-			xQueueSendToBack( load_mngmnt_queue, (void *)&activate_load_management, (TickType_t)0 );
+			xQueueSendToBack( stability_queue, (void *)&activate_load_management, (TickType_t)0 );
 		}
 
 		//printf("Frequency %.2f Hz \n", frequency_value);
@@ -223,59 +259,109 @@ void load_user_inputs(void){
 	}
 
 }
+
+void system_stablity(void* pvParameters){
+	int load_management;
+	int val_received;
+	while(1){
+		val_received = xQueueReceive( stability_queue, &( load_stability_flag ), ( TickType_t ) pdMS_TO_TICKS(500) );
+		if(load_stability_flag == 1 && loads_shed == 0) {
+			if (tick_load_mngmnt_entry == 0) {
+				tick_load_mngmnt_entry = xTaskGetTickCount();
+				printf("Started %d\n", tick_load_mngmnt_entry);
+			}
+			load_management = 1;
+			xQueueSendToBack( load_mngmnt_queue, (void *)&load_management, (TickType_t)0 );
+		} else if(load_stability_flag == 0 && loads_shed == 0 && val_received == 0){// stable
+			load_management = 0;
+			xQueueSendToBack( load_mngmnt_queue, (void *)&load_management, (TickType_t)0 );
+		} else if (val_received == 0) {
+			xQueueSendToBack( load_mngmnt_queue, (void *)&load_management, (TickType_t)0 );
+		}
+	}
+}
+
+
 void load_user_mgmnt(void* pvParameters){
 	int i;
 	int initiate_load_shed = 0;
 		while(1){
 
-
 			load_user_inputs();
-
-			 if( xQueueReceive( load_mngmnt_queue, &( load_stability_flag ), ( TickType_t ) pdMS_TO_TICKS(500) ) )
-			        {
-			            // pcRxedMessage now points to the struct AMessage variable posted
-			            // by vATask.
-				 	 //
-				 no_of_activated_loads = 0;
-					for( i = 0; i<NO_OF_LOADS; i++){
-						no_of_activated_loads += loads[i];
-						}
-				 	 if (load_stability_flag == 1 && loads_shed == 0 && (loads_shed < no_of_activated_loads)){ // needs to be within 200ms
-				 		 shed_load();
-				 	 }
-
-
-			        }
-			 else if(load_stability_flag == 1 && (loads_shed < no_of_activated_loads)){
-				 shed_load();
-				 //printf("drop another load \n");
-
-			 }
-			 else if(load_stability_flag == 0){
-				 if(loads_shed > 0){
-
-					 reenable_load();
-
-
-				 }else{
-						for( i = 0; i<NO_OF_LOADS; i++){
-								load_state_array[i] = loads[i] ? on : off;
-							}
-				 }
-
-
-			 }
-			 red_led_out = 0;
-			 green_led_out = 0;
+			if (user_management_mode == 1){
+				//load_user_inputs();
+				user_mode = 1;
+				 red_led_out = 0;
+				 green_led_out = 0;
 				for( i = 0; i<NO_OF_LOADS; i++){
-						red_led_out += load_state_array[i] == on ? 1 << i : 0;
-						green_led_out += load_state_array[i] == shed ? 1 << i : 0;
+						red_led_out += loads[i] << i;
+						//green_led_out += load_state_array[i] == shed ? 1 << i : 0;
 					}
 
 
 				IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, red_led_out);
 				IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, green_led_out);
+				vTaskDelay(100);
 
+			}
+			else{
+			user_mode = 0;
+
+			if( xQueueReceive( load_mngmnt_queue, &( system_management_mode ), ( TickType_t ) pdMS_TO_TICKS(50) ) )
+			{
+				// pcRxedMessage now points to the struct AMessage variable posted
+				// by vATask.
+				//
+
+				if (system_management_mode == 1) {
+					if(load_stability_flag == 1) {
+						if (loads_shed == 0) {
+							no_of_activated_loads = 0;
+							for( i = 0; i<NO_OF_LOADS; i++){
+								no_of_activated_loads += loads[i];
+							}
+						}
+						if (loads_shed < no_of_activated_loads){
+							shed_load();
+						}
+					}
+					else if(load_stability_flag == 0 && loads_shed > 0){// stable
+						reenable_load();
+					}
+				}
+			} else if (system_management_mode == 1){
+				for( i = 0; i<NO_OF_LOADS; i++){
+					if( loads[i] == 1 && load_state_array[i] == off) {
+						load_state_array[i] = shed;
+						no_of_activated_loads++;
+						loads_shed++;
+					} else if (loads[i] == 0 && load_state_array[i] == on) {
+						load_state_array[i] = off;
+						no_of_activated_loads--;
+					} else if (loads[i] == 0 && load_state_array[i] == shed) {
+						load_state_array[i] = off;
+						no_of_activated_loads--;
+						loads_shed--;
+					}
+				}
+			} else {
+				for( i = 0; i<NO_OF_LOADS; i++){
+					load_state_array[i] = loads[i];
+				}
+			}
+
+			red_led_out = 0;
+			green_led_out = 0;
+			for( i = 0; i<NO_OF_LOADS; i++){
+				red_led_out += load_state_array[i] == on ? 1 << i : 0;
+				green_led_out += load_state_array[i] == shed ? 1 << i : 0;
+			}
+
+
+			IOWR_ALTERA_AVALON_PIO_DATA(RED_LEDS_BASE, red_led_out);
+			IOWR_ALTERA_AVALON_PIO_DATA(GREEN_LEDS_BASE, green_led_out);
+
+			}
 		}
 
 
@@ -288,19 +374,44 @@ void reenable_load(void){
 		if (load_state_array[i] == shed) {
 			load_state_array[i] = on;
 			loads_shed--;
-			printf("load reenabled: %d \n", i);
+			//printf("load reenabled: %d \n", i);
 			break;
 		}
 	}
 }
 void shed_load(void){
-
+	int current_time_ticks;
 	int i;
 	for( i = 0; i<NO_OF_LOADS; i++){
 		if (load_state_array[i] == on) {
 			load_state_array[i] = shed;
+			if(loads_shed == 0){
+				tick_load_first_shed = xTaskGetTickCount();
+				printf("tick_load_first_shed %d\n", tick_load_first_shed);
+				current_time_ticks = tick_load_first_shed-tick_load_mngmnt_entry;
+				tick_load_mngmnt_entry = 0;
+				current_time_ticks *= portTICK_PERIOD_MS;
+				printf("current_time_ticks %d\n", current_time_ticks);
+				if (current_time_ticks < current_min_ticks || no_of_time_measurements == 0){
+					current_min_ticks = current_time_ticks;
+				}
+				if (current_time_ticks > current_max_ticks || no_of_time_measurements == 0){
+					current_max_ticks = current_time_ticks;
+				}
+				printf("current_min_ticks %d\n", current_min_ticks);
+				printf("current_max_ticks %d\n", current_max_ticks);
+
+				average_ticks *= no_of_time_measurements;
+				time_measurements[no_of_time_measurements++ % 5] = current_time_ticks;
+				average_ticks /= no_of_time_measurements;
+				average_ticks += current_time_ticks / no_of_time_measurements;
+				printf("average_ticks %f\n", average_ticks);
+
+			}
+
+
 			loads_shed++;
-			printf("load shed: %d \n", i);
+			//printf("load shed: %d \n", i);
 			break;
 		}
 	}
@@ -345,6 +456,7 @@ void initVGA(void){
 		}
 		alt_up_char_buffer_clear(char_buf);
 }
+
 void initInterrupts(void){
 
 	// PS2
@@ -380,8 +492,10 @@ int initOSDataStructs(void)
 	thres_freq = 49.00;
 	thres_delta = 25.00;
 	load_stability_flag = 0;
+
 	x_sem_loads = xSemaphoreCreateBinary();
 	Q_freq_data = xQueueCreate( 100, sizeof( struct freq_struct) );
+	stability_queue = xQueueCreate( MSG_QUEUE_SIZE, sizeof( int) );
 	load_mngmnt_queue = xQueueCreate( MSG_QUEUE_SIZE, sizeof( int) );
 	msgqueue = xQueueCreate( MSG_QUEUE_SIZE, sizeof( void* ) );
 	shared_resource_sem = xSemaphoreCreateCounting( 9999, 1 );
@@ -395,10 +509,13 @@ int initCreateTasks(void)
 
 
 	//create_vga_task();
+
 	xTaskCreate(PRVGADraw_Task, "VGA_Task", TASK_STACKSIZE, NULL, VGA_TASK_PRIORITY, &PRVGADraw);
 //	xTaskCreate(Led_Out, "Led_Out", TASK_STACKSIZE, NULL, LED_OUT_PRIORITY, &xbuttonLEDs);
 	xTaskCreate(load_user_mgmnt, "load_user_mgmnt", TASK_STACKSIZE, NULL, LOAD_USER_MNGMNT_PRIORITY, &xLoadMgnmntTask);
 	xTaskCreate(frequency_calculator, "frequency_calculator", TASK_STACKSIZE, NULL, FREQUENCY_CALCULATOR_PRIORITY, &xFreqTask);
+	xTaskCreate(system_stablity, "system_stablity", TASK_STACKSIZE, NULL, SYSTEM_STABILITY_PRIORITY, &xSystemStabilityTask);
+	//xTaskCreate( Timer_Reset_Task, "0", configMINIMAL_STACK_SIZE, NULL, Timer_Reset_Task_P, &Timer_Reset );
 
 
 	return 0;

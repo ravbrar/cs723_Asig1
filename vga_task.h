@@ -27,6 +27,15 @@ void create_vga_task(void);
 void PRVGADraw_Task(void *pvParameters);
 float thres_freq;
 float thres_delta;
+int user_mode;
+int time_measurements[5];
+int no_of_time_measurements;
+int current_min_ticks;
+int current_max_ticks;
+float average_ticks;
+
+
+
 int load_stability_flag;
 
 #endif /* VGA_TASK_H_ */

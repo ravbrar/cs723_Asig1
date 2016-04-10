@@ -27,6 +27,10 @@
 
 double freq[100], dfreq[100];
 
+char *freq_info;
+char *delta_info;
+char *char_disp;
+
 typedef struct{
 	unsigned int x1;
 	unsigned int y1;
@@ -34,12 +38,15 @@ typedef struct{
 	unsigned int y2;
 }Line;
 
-
 /****** VGA display ******/
 
 void PRVGADraw_Task(void *pvParameters ){
 
-
+	int index;
+	int offset;
+	int display_done;
+	int value;
+	int current_time;
 
 	//Set up plot axes
 	alt_up_pixel_buffer_dma_draw_hline(pixel_buf, 100, 590, 200, ((0x3ff << 20) + (0x3ff << 10) + (0x3ff)), 0);
@@ -107,13 +114,54 @@ void PRVGADraw_Task(void *pvParameters ){
 				alt_up_pixel_buffer_dma_draw_line(pixel_buf, line_roc.x1, line_roc.y1, line_roc.x2, line_roc.y2, 0x3ff << 0, 0);
 			}
 		}
+		sprintf(freq_info, "Freq Threshold  %.1f", thres_freq);
+		alt_up_char_buffer_string(char_buf, freq_info, 4, 40);
+		sprintf(delta_info, "Delta Threshold  %.1f", thres_delta);
+		alt_up_char_buffer_string(char_buf, delta_info, 4, 41);
+
+
+		if (no_of_time_measurements > 0) {
+			alt_up_char_buffer_string(char_buf, "Time taken", 50, 40);
+			sprintf(char_disp, current_max_ticks == 0 ? "Max <1ms   " : "Max %dms   ", current_max_ticks);
+			alt_up_char_buffer_string(char_buf, char_disp, 56, 41);
+			sprintf(char_disp, current_min_ticks == 0 ? "Min <1ms   " : "Min %dms   ", current_min_ticks);
+			alt_up_char_buffer_string(char_buf, char_disp, 56, 42);
+			sprintf(char_disp, average_ticks < 1.0 ? "Avg <1ms   ": "Avg %.1fms   ", average_ticks);
+			alt_up_char_buffer_string(char_buf, char_disp, 56, 43);
+
+			display_done = 0;
+			offset = 0;
+			alt_up_char_buffer_string(char_buf, "History: ", 50, 45);
+			while (display_done == 0){
+				index = no_of_time_measurements - 1 - offset;
+				if (offset++ == 5 || index < 0 ) {
+					display_done = 1;
+					break;
+				}
+				value = time_measurements[index % 5];
+				sprintf(char_disp, value == 0 ? "<1ms   " : "%dms   ", value);
+				alt_up_char_buffer_string(char_buf, char_disp, 60, 44 + offset);
+			}
+		}
+		if(user_mode == 1){
+			alt_up_char_buffer_string(char_buf,     "User Managed",33, 4);
+		}
+		else{
+			if(load_stability_flag == 1){
+				alt_up_char_buffer_string(char_buf, "  Unstable  ", 33, 4);
+			}else{
+				alt_up_char_buffer_string(char_buf, "   Stable   ", 33, 4);
+			}
+		}
+
+		current_time = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
+
+		sprintf(char_disp, "System online %2dm %2ds   ", current_time / 60, current_time % 60);
+		alt_up_char_buffer_string(char_buf, char_disp, 50, 54);
+
 		vTaskDelay(10);
 
-		if(load_stability_flag == 1){
-			alt_up_char_buffer_string(char_buf, "Unstable", 35, 4);
-		}else{
-			alt_up_char_buffer_string(char_buf, "Stable  ", 35, 4);
-		}
+
 
 	}
 }
